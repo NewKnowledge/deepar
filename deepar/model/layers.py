@@ -2,20 +2,20 @@ import tensorflow as tf
 from tensorflow.keras.layers import LSTM, Layer
 from tensorflow.keras.activations import softplus
 
-class LSTMResetStateful(LSTM):
+# class LSTMResetStateful(LSTM):
 
-    def __init__(self, *args, **kwargs):
-        super(LSTMResetStateful, self).__init__(*args, **kwargs)
+#     def __init__(self, *args, **kwargs):
+#         super(LSTMResetStateful, self).__init__(*args, **kwargs)
 
-    def build(self, *args, **kwargs):
-        super(LSTMResetStateful, self).build(*args, **kwargs)
+#     def build(self, *args, **kwargs):
+#         super(LSTMResetStateful, self).build(*args, **kwargs)
 
-    def call(self, inputs, mask = None, training = None):
+#     def call(self, inputs, mask = None, training = None):
         
-        if training:
-            self.reset_states()
+#         if training:
+#             self.reset_states()
         
-        return super(LSTMResetStateful, self).call(inputs, mask = mask, training = training)
+#         return super(LSTMResetStateful, self).call(inputs, mask = mask, training = training)
 
 class GaussianLayer(Layer):
     """

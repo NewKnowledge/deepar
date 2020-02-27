@@ -1,21 +1,17 @@
 import logging
 import os
 import time
-import sys
 import math
 import typing
 
 import numpy as np
 
 import tensorflow as tf
-from tensorflow.keras.layers import Input, Dense, LSTM, Embedding, Concatenate
-from tensorflow.keras.models import Model
-from tensorflow.keras.activations import relu, softplus
 from tensorflow.keras.optimizers import Adam, SGD
 from tensorflow.keras.callbacks import (
-    ModelCheckpoint,
-    LearningRateScheduler,
-    ReduceLROnPlateau,
+    # ModelCheckpoint,
+    # LearningRateScheduler,
+    # ReduceLROnPlateau,
     TensorBoard,
 )
 from tensorflow.keras.metrics import RootMeanSquaredError, MeanAbsoluteError, Mean
@@ -24,7 +20,6 @@ from deepar.model.loss import (
     unscale,
     GaussianLogLikelihood,
     NegativeBinomialLogLikelihood,
-    build_tf_lookup,
 )
 from deepar.dataset.time_series import (
     TimeSeriesTrain,
@@ -32,11 +27,11 @@ from deepar.dataset.time_series import (
     train_ts_generator,
     test_ts_generator,
 )
-from deepar.model.layers import LSTMResetStateful, GaussianLayer
+from deepar.model.models import DeepARModel
 from deepar.model.callbacks import EarlyStopping
 
 logger = logging.getLogger(__name__)
-# logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 class DeepARLearner:
@@ -44,16 +39,17 @@ class DeepARLearner:
         self,
         ts_obj: TimeSeriesTrain,
         output_dim: int = 1,
-        emb_dim: int = 128,
-        lstm_dim: int = 128,
+        emb_dim: typing.List[int] = None,
+        lstm_dim: int = 40,
+        num_layers: int = 2,
         dropout: float = 0.1,
         optimizer: str = "adam",
+        clip_gradient: int = 10,
         lr: float = 0.001,
         batch_size: int = 16,
+        init: str = "glorot_uniform",
         # scheduler=None,
         train_window: int = 20,
-        verbose: int = 0,
-        # mask_value: int=0,
         random_seed: int = None,
         hparams: typing.Dict[str, typing.Union[int, float]] = None,
     ):
@@ -64,14 +60,17 @@ class DeepARLearner:
         
         Keyword Arguments:
             output_dim {int} -- dimension of output variables (default: {1})
-            emb_dim {int} -- dimension of categorical embeddings (default: {128})
-            lstm_dim {int} -- dimension of lstm cells (default: {128})
+            emb_dim {int} -- dimension of categorical embeddings, if None, dimension of each
+                embedding will be min(50, (cardinality + 1) / 2) (default: {None})
+            lstm_dim {int} -- dimension of lstm cells (default: {40})
+            num_layers {int} -- number of lstm layers (default: {2})
             dropout {float} -- dropout (default: {0.1})
             optimizer {str} -- options are "adam" and "sgd" (default: {"adam"})
+            clip_gradient {int} -- absolute value at which to clip gradients (default: {10})
             lr {float} -- learning rate (default: {0.001})
             batch_size {int} -- number of time series to sample in each batch (default: {16})
+            init {str} -- initializer for weights in network (default: {"glorot_uniform"})
             train_window {int} -- the length of time series sampled for training. consistent throughout (default: {20})
-            verbose {int} -- (default: {0})
             random_seed {int} -- optional random seed to control randomness throughout learner (default: {None})
             hparams {typing.Dict[str, typing.Union[int, float]]} -- 
                 dict of hyperparameters (keys) and hp domain (values) over which to hp search (default: {None})
@@ -79,10 +78,6 @@ class DeepARLearner:
 
         if random_seed is not None:
             tf.random.set_seed(random_seed)
-        assert verbose == 0 or verbose == 1, "argument verbose must be 0 or 1"
-        if verbose == 1:
-            logger.setLevel(logging.INFO)
-        self._verbose = verbose
 
         if hparams is None:
             self._lr = lr
@@ -97,7 +92,6 @@ class DeepARLearner:
             dropout = hparams["lstm_dropout"]
 
         # Invariance - Window size must be <= max_series_length + negative observations to respect covariates
-        
         if self._train_window > ts_obj.max_age:
             logger.info(
                 f"Training set with max observations {ts_obj.max_age} does not support train window size of "
@@ -108,21 +102,27 @@ class DeepARLearner:
         self._ts_obj = ts_obj
 
         # define model
-        self._model = self._create_model(
-            self._ts_obj.num_cats,
-            self._ts_obj.features,
-            output_dim=output_dim,
+        self._model = DeepARModel(
+            num_features=self._ts_obj.features,
+            train_window=self._train_window,
+            cardinalities=self._ts_obj.cardinalities,
             emb_dim=emb_dim,
+            output_dim=output_dim,
             lstm_dim=lstm_dim,
+            num_layers=num_layers,
+            batch_size=batch_size,
             dropout=dropout,
+            init=init,
             count_data=self._ts_obj.count_data,
         )
 
         # define optimizer
         if optimizer == "adam":
-            self._optimizer = Adam(learning_rate=self._lr)
+            self._optimizer = Adam(learning_rate=self._lr, clipvalue=clip_gradient)
         elif optimizer == "sgd":
-            self._optimizer = SGD(lr=self._lr, momentum=0.1, nesterov=True)
+            self._optimizer = SGD(
+                lr=self._lr, momentum=0.1, nesterov=True, clipvalue=clip_gradient
+            )
         else:
             raise ValueError("Optimizer must be one of `adam` and `sgd`")
 
@@ -149,57 +149,6 @@ class DeepARLearner:
             filepath {str} -- filepath
         """
         self._model.load_weights(filepath)
-
-    def _create_model(
-        self,
-        num_cats: int,
-        num_features: int,
-        output_dim: int = 1,
-        emb_dim: int = 128,
-        lstm_dim: int = 128,
-        batch_size: int = 16,
-        dropout: float = 0.1,
-        count_data: bool = False,
-    ) -> Model:
-        """ 
-        util function
-            creates model architecture (Keras Sequential) with arguments specified in constructor
-        """
-
-        cont_inputs = Input(
-            shape=(self._train_window, num_features), batch_size=self._batch_size
-        )
-        cat_inputs = Input(shape=(self._train_window,), batch_size=self._batch_size)
-        embedding = Embedding(num_cats, emb_dim)(cat_inputs)
-        concatenate = Concatenate()([cont_inputs, embedding])
-
-        lstm_out = LSTMResetStateful(
-            lstm_dim,
-            return_sequences=True,
-            stateful=True,
-            dropout=dropout,
-            recurrent_dropout=dropout,
-            unit_forget_bias=True,
-            name="lstm",
-        )(concatenate)
-
-        mu = Dense(
-            output_dim,
-            kernel_initializer="glorot_normal",
-            bias_initializer="glorot_normal",
-            name="mu",
-        )(lstm_out)
-
-        sigma = Dense(
-            output_dim,
-            kernel_initializer="glorot_normal",
-            bias_initializer="glorot_normal",
-            name="sigma",
-        )(lstm_out)
-
-        model = Model(inputs=[cont_inputs, cat_inputs], outputs=[mu, sigma])
-
-        return model
 
     def _training_loop(
         self,
@@ -229,28 +178,23 @@ class DeepARLearner:
             patience=stopping_patience, active=early_stopping, delta=stopping_delta
         )
 
-        # setup table for unscaling
-        self._lookup_table = build_tf_lookup(self._ts_obj.target_means)
-
         # Iterate over epochs.
         best_metric = math.inf
         for epoch in range(epochs):
             logger.info(f"Start of epoch {epoch}")
             start_time = time.time()
-            for batch, (x_batch_train, cat_labels, y_batch_train) in enumerate(
+            import sys
+
+            for batch, (x_batch_train, scale_values, y_batch_train) in enumerate(
                 train_gen
             ):
-
                 # compute loss
                 with tf.GradientTape(persistent=True) as tape:
                     mu, scale = self._model(x_batch_train, training=True)
-
-                    # softplus parameters
-                    scale = softplus(scale)
-                    if self._ts_obj.count_data:
-                        mu = softplus(mu)
-
-                    mu, scale = unscale(mu, scale, cat_labels, self._lookup_table)
+                    
+                    mu, scale = unscale(
+                        mu, scale, scale_values
+                    )
                     loss_value = self._loss_fn(y_batch_train, (mu, scale))
 
                 # sgd
@@ -261,7 +205,9 @@ class DeepARLearner:
                 batch_loss_avg(loss_value)
                 epoch_loss_avg(loss_value)
                 grads = tape.gradient(loss_value, self._model.trainable_weights)
-                self._optimizer.apply_gradients(zip(grads, self._model.trainable_weights))
+                self._optimizer.apply_gradients(
+                    zip(grads, self._model.trainable_weights)
+                )
 
                 # Log 5x per epoch.
                 if batch % (steps_per_epoch // 5) == 0 and batch != 0:
@@ -282,7 +228,7 @@ class DeepARLearner:
             if val_gen is not None:
                 logger.info(f"End of epoch {epoch}, validating...")
                 start_time = time.time()
-                for batch, (x_batch_val, cat_labels, y_batch_val) in enumerate(val_gen):
+                for batch, (x_batch_val, scale_values, y_batch_val) in enumerate(val_gen):
 
                     # compute loss, doesn't need to be persistent bc not updating weights
                     with tf.GradientTape() as tape:
@@ -290,11 +236,10 @@ class DeepARLearner:
                         # treat as training -> reset lstm states inbetween each batch
                         mu, scale = self._model(x_batch_val, training=True)
 
-                        # softplus parameters
-                        mu, scale = self._softplus(mu, scale)
-
                         # unscale parameters
-                        mu, scale = unscale(mu, scale, cat_labels, self._lookup_table)
+                        mu, scale = unscale(
+                            mu, scale, scale_values
+                        )
 
                         # calculate loss
                         loss_value = self._loss_fn(y_batch_val, (mu, scale))
@@ -410,7 +355,6 @@ class DeepARLearner:
             self._ts_obj,
             self._batch_size,
             self._train_window,
-            verbose=self._verbose,
         )
 
         # validation generator
@@ -420,7 +364,6 @@ class DeepARLearner:
                 self._ts_obj,
                 self._batch_size,
                 self._train_window,
-                verbose=self._verbose,
                 val_set=True,
             )
         else:
@@ -446,20 +389,7 @@ class DeepARLearner:
             dynamically generated last target  
         """
         x_test_new = x_test[0][:, :1, -1:].assign(prev_target)
-        return [x_test_new, x_test[1]]
-
-    def _softplus(
-        self, mu: tf.Tensor, scale: tf.Tensor,
-    ) -> typing.Tuple[tf.Tensor, tf.Tensor]:
-
-        """
-        private util function that applies softplus transformation to various parameters
-            depending on type of data 
-        """
-        scale = softplus(scale)
-        if self._ts_obj.count_data:
-            mu = softplus(mu)
-        return mu, scale
+        return [x_test_new, *x_test[1:]]
 
     def _squeeze(
         self, mu: tf.Tensor, scale: tf.Tensor, squeeze_dims: typing.List[int] = [2]
@@ -557,11 +487,10 @@ class DeepARLearner:
             self._batch_size,
             self._train_window,
             include_all_training=include_all_training,
-            verbose=self._verbose,
         )
 
         # reset lstm states before prediction
-        self._model.get_layer("lstm").reset_states()
+        self._model.reset_lstm_states()
 
         # make sure horizon is legitimate value
         if horizon is None or horizon > test_ts_obj.horizon:
@@ -574,7 +503,7 @@ class DeepARLearner:
 
         for batch_idx, batch in enumerate(test_gen):
 
-            x_test, scale_keys, horizon_idx, iteration_index = batch
+            x_test, scale_values, horizon_idx, iteration_index = batch
             if iteration_index is None:
                 break
             if horizon_idx == horizon:
@@ -584,7 +513,7 @@ class DeepARLearner:
 
             # reset lstm states for new sequence of predictions through time
             if iteration_index != prev_iteration_index:
-                self._model.get_layer("lstm").reset_states()
+                self._model.reset_lstm_states()
 
             # don't need to replace for first test batch bc have tgt from last training example
             if horizon_idx > 1:
@@ -594,14 +523,12 @@ class DeepARLearner:
 
             # make predictions
             mu, scale = self._model(x_test)
-            mu, scale = self._softplus(mu, scale)
 
             # unscale
             scaled_mu, scaled_scale = unscale(
-                mu[: scale_keys.shape[0]],
-                scale[: scale_keys.shape[0]],
-                scale_keys,
-                self._lookup_table,
+                mu[: len(scale_values)],
+                scale[: len(scale_values)],
+                scale_values,
             )
 
             # in-sample predictions (ancestral sampling)
@@ -666,7 +593,9 @@ class DeepARLearner:
 
         # filter test_samples depending on return_in_sample_predictions param
         if return_in_sample_predictions:
-            pred_samples = np.array(test_samples)[:, -(self._ts_obj.max_age + horizon):, :]
+            pred_samples = np.array(test_samples)[
+                :, -(self._ts_obj.max_age + horizon) :, :
+            ]
         else:
             pred_samples = np.array(test_samples)[:, -horizon:, :]
 

@@ -9,48 +9,26 @@ from tensorflow.keras.losses import Loss, Reduction
 from tensorflow.keras.activations import softplus
 
 
-def build_tf_lookup(scale_data: pd.Series) -> tf.lookup.StaticHashTable:
-
-    """ create and return tf hash table mapping scale keys to scale values 
-    
-    Arguments:
-        scale_data {pd.Series} -- index = scale keys and values = scale values 
-    
-    Returns:
-        tf.lookup.StaticHashTable -- tf hash table mapping scale keys to scale values 
-    """
-
-    return tf.lookup.StaticHashTable(
-        initializer=tf.lookup.KeyValueTensorInitializer(
-            keys=tf.constant(scale_data.index.values, dtype=tf.int32),
-            values=tf.constant(scale_data.values, dtype=tf.float32),
-        ),
-        default_value=tf.constant(-1, dtype=tf.float32),
-    )
-
-
 def unscale(
-    mu: tf.Tensor,
-    scale: tf.Tensor,
-    scale_keys: tf.Tensor,
-    hash_table: tf.lookup.StaticHashTable,
+    mu: tf.Tensor, sigma: tf.Tensor, scale_values: tf.Tensor,
 ) -> typing.Tuple[tf.Tensor, tf.Tensor]:
     """ unscales predictions (mu and scale) using scale_keys and values
     
     Arguments:
         mu {tf.Tensor} -- mu
         scale {tf.Tensor} -- scale
-        scale_keys {tf.Tensor} -- scale keys, must be same shape as mu and theta 
-        hash_table {tf.lookup.StaticHashTable} -- tf static hash table mapping scale keys to scale values
+        scale_values {tf.Tensor} -- values that should unscale mu and scale
+            unscaled_mu = mu * scale_values
+            unscaled_sigma = sigma / sqrt(scale_values)
     
     Returns:
         typing.Tuple[tf.Tensor, tf.Tensor] -- (unscaled mu, unscaled scale)
     """
 
     # unscale mu and sigma
-    scale_values = tf.expand_dims(hash_table.lookup(scale_keys), 1)
+    scale_values = tf.expand_dims(tf.expand_dims(scale_values, -1), -1)
     unscaled_mu = tf.multiply(mu, scale_values)
-    unscaled_sigma = tf.divide(scale, tf.sqrt(scale_values))
+    unscaled_sigma = tf.divide(sigma, tf.sqrt(scale_values))
     return unscaled_mu, unscaled_sigma
 
 
