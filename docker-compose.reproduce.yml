@@ -1,0 +1,7 @@
+version: '3'
+
+services:
+    reproduce-amazon:
+        image: reproduce-amazon
+        volumes:
+            - ./notebooks:/root/notebooks

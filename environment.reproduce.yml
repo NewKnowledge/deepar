@@ -1,0 +1,9 @@
+name: base
+channels:
+- defaults
+dependencies:
+- pip
+- pip:
+  - jupyter
+  - mxnet==1.4.1 
+  - gluonts

@@ -1,0 +1,10 @@
+name: base
+channels:
+- defaults
+dependencies:
+- pip
+- pandas
+- numpy
+- scikit-learn
+- pip:
+  - tensorflow
